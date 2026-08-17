@@ -1,0 +1,4 @@
+# External Buildroot tree for custom packages
+# Included when running make with BR2_EXTERNAL=./external
+
+source "package/poe_watchdog/Config.in"

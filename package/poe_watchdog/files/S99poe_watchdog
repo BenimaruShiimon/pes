@@ -1,0 +1,37 @@
+#!/bin/sh
+# /etc/init.d/S99poe_watchdog — запуск демона poe_watchdog под BusyBox init
+
+DAEMON=/usr/sbin/poe_watchdog
+PIDFILE=/var/run/poe_watchdog.pid
+CONF=/etc/poe_watchdog.conf
+
+start() {
+    echo "Starting poe_watchdog..."
+    start-stop-daemon -S -q -p "$PIDFILE" -x "$DAEMON" -- -c "$CONF"
+}
+
+stop() {
+    echo "Stopping poe_watchdog..."
+    start-stop-daemon -K -q -p "$PIDFILE"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) restart ;;
+    reload)
+        [ -f "$PIDFILE" ] && kill -HUP "$(cat "$PIDFILE")"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|reload}"
+        exit 1
+        ;;
+esac
+
+exit 0
