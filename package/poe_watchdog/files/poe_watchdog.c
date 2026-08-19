@@ -62,6 +62,165 @@ static char ctl_script[LINE_MAX_LEN] = DEFAULT_CTL_SCRIPT;
 static void handle_sighup(int sig)  { (void)sig; g_reload = 1; }
 static void handle_sigterm(int sig) { (void)sig; g_stop = 1; }
 
+static void trim_inplace(char *s)
+{
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r' || s[len - 1] == ' ' || s[len - 1] == '\t')) {
+        s[len - 1] = '\0';
+        len--;
+    }
+    char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p != s) {
+        memmove(s, p, strlen(p) + 1);
+    }
+}
+
+static int parse_target_line(const char *line, target_t *out)
+{
+    char pbuf[LINE_MAX_LEN];
+    char *p;
+    target_t t;
+
+    if (!line || !out) return -1;
+    snprintf(pbuf, sizeof(pbuf), "%s", line);
+    trim_inplace(pbuf);
+    if (pbuf[0] == '#' || pbuf[0] == '\0') return -1;
+
+    memset(&t, 0, sizeof(t));
+    /* Supported formats:
+     * 1) port ip interval fail_threshold cooldown cycle_pause
+     * 2) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold
+     * 3) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode
+     * 4) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode watch_scope
+     */
+    p = pbuf;
+    int got = sscanf(p, "%31s %63s %d %d %d %d %31s %d %31s %31s",
+                     t.port, t.ip, &t.interval,
+                     &t.fail_threshold, &t.cooldown, &t.cycle_pause,
+                     t.monitor_iface, &t.idle_threshold, t.mode, t.watch_scope);
+    if (got < 6) {
+        return -1;
+    }
+    if (got < 8) {
+        t.monitor_iface[0] = '\0';
+        t.idle_threshold = 0;
+        t.mode[0] = '\0';
+        t.watch_scope[0] = '\0';
+    } else if (got < 9) {
+        t.mode[0] = '\0';
+        t.watch_scope[0] = '\0';
+    } else if (got < 10) {
+        t.watch_scope[0] = '\0';
+    }
+    if (t.mode[0] == '\0') {
+        snprintf(t.mode, sizeof(t.mode), "SEMIAUTO");
+    }
+    if (t.watch_scope[0] == '\0') {
+        snprintf(t.watch_scope, sizeof(t.watch_scope), "both");
+    }
+    if (t.interval <= 0) t.interval = 5;
+    if (t.fail_threshold <= 0) t.fail_threshold = 3;
+    if (t.cooldown < 0) t.cooldown = 60;
+    if (t.cycle_pause < 0) t.cycle_pause = 3;
+    t.fail_count = 0;
+    t.next_check = 0;
+    t.cooldown_until = 0;
+    t.cycles_done = 0;
+    t.last_pkt_count = 0ULL;
+    t.last_pkt_time = 0;
+    *out = t;
+    return 0;
+}
+
+static void format_target_line(const target_t *t, char *buf, size_t size)
+{
+    int written = 0;
+    if (size == 0) return;
+    written = snprintf(buf, size, "%s %s %d %d %d %d",
+                       t->port, t->ip, t->interval,
+                       t->fail_threshold, t->cooldown, t->cycle_pause);
+    if (written < 0 || (size_t)written >= size) return;
+    if (t->monitor_iface[0] != '\0') {
+        int extra = snprintf(buf + written, size - (size_t)written, " %s %d",
+                             t->monitor_iface, t->idle_threshold);
+        if (extra > 0 && (size_t)extra < size - (size_t)written) {
+            written += extra;
+        }
+    }
+    if (t->mode[0] != '\0') {
+        int extra = snprintf(buf + written, size - (size_t)written, " %s", t->mode);
+        if (extra > 0 && (size_t)extra < size - (size_t)written) {
+            written += extra;
+        }
+    }
+    if (t->watch_scope[0] != '\0') {
+        int extra = snprintf(buf + written, size - (size_t)written, " %s", t->watch_scope);
+        if (extra > 0 && (size_t)extra < size - (size_t)written) {
+            written += extra;
+        }
+    }
+}
+
+static int update_config_file(const char *path, const char *line)
+{
+    target_t new_target;
+    char tmp_path[LINE_MAX_LEN];
+    char normalized[LINE_MAX_LEN];
+    char file_line[LINE_MAX_LEN];
+    FILE *src = NULL;
+    FILE *dst = NULL;
+    int found = 0;
+
+    if (parse_target_line(line, &new_target) != 0) {
+        fprintf(stderr, "Ошибка: некорректная строка target '%s'\n", line);
+        return 1;
+    }
+    format_target_line(&new_target, normalized, sizeof(normalized));
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    dst = fopen(tmp_path, "w");
+    if (!dst) {
+        fprintf(stderr, "Ошибка: не удалось создать временный конфиг %s: %s\n", tmp_path, strerror(errno));
+        return 1;
+    }
+
+    src = fopen(path, "r");
+    if (src) {
+        while (fgets(file_line, sizeof(file_line), src)) {
+            target_t existing;
+            char *p = file_line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#' || *p == '\n' || *p == '\0') {
+                fputs(file_line, dst);
+                continue;
+            }
+            if (parse_target_line(file_line, &existing) == 0 && strcmp(existing.port, new_target.port) == 0) {
+                fprintf(dst, "%s\n", normalized);
+                found = 1;
+                continue;
+            }
+            fputs(file_line, dst);
+        }
+        fclose(src);
+    }
+
+    if (!found) {
+        fprintf(dst, "%s\n", normalized);
+    }
+    fclose(dst);
+
+    if (rename(tmp_path, path) != 0) {
+        fprintf(stderr, "Ошибка: не удалось сохранить конфиг %s: %s\n", path, strerror(errno));
+        unlink(tmp_path);
+        return 1;
+    }
+
+    printf("Обновлён конфиг %s: %s\n", path, normalized);
+    return 0;
+}
+
 static int load_config(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -74,53 +233,14 @@ static int load_config(const char *path)
     int n = 0;
     char line[LINE_MAX_LEN];
     while (fgets(line, sizeof(line), f) && n < MAX_TARGETS) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n' || *p == '\0') continue;
-
         target_t t;
-        memset(&t, 0, sizeof(t));
-        /* Supported formats:
-         * 1) port ip interval fail_threshold cooldown cycle_pause
-         * 2) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold
-         * 3) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode
-         * 4) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode watch_scope
-         */
-        int got = sscanf(p, "%31s %63s %d %d %d %d %31s %d %31s %31s",
-                         t.port, t.ip, &t.interval,
-                         &t.fail_threshold, &t.cooldown, &t.cycle_pause,
-                         t.monitor_iface, &t.idle_threshold, t.mode, t.watch_scope);
-        if (got < 6) {
+        if (parse_target_line(line, &t) != 0) {
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#' || *p == '\n' || *p == '\0') continue;
             syslog(LOG_WARNING, "poe_watchdog: игнорирую некорректную строку конфига: %s", line);
             continue;
         }
-        if (got < 8) {
-            t.monitor_iface[0] = '\0';
-            t.idle_threshold = 0;
-            t.mode[0] = '\0';
-            t.watch_scope[0] = '\0';
-        } else if (got < 9) {
-            t.mode[0] = '\0';
-            t.watch_scope[0] = '\0';
-        } else if (got < 10) {
-            t.watch_scope[0] = '\0';
-        }
-        if (t.mode[0] == '\0') {
-            snprintf(t.mode, sizeof(t.mode), "SEMIAUTO");
-        }
-        if (t.watch_scope[0] == '\0') {
-            snprintf(t.watch_scope, sizeof(t.watch_scope), "both");
-        }
-        if (t.interval <= 0) t.interval = 5;
-        if (t.fail_threshold <= 0) t.fail_threshold = 3;
-        if (t.cooldown < 0) t.cooldown = 60;
-        if (t.cycle_pause < 0) t.cycle_pause = 3;
-        t.fail_count = 0;
-        t.next_check = 0;
-        t.cooldown_until = 0;
-        t.cycles_done = 0;
-        t.last_pkt_count = 0ULL;
-        t.last_pkt_time = 0;
         targets[n++] = t;
         syslog(LOG_DEBUG, "poe_watchdog: added target port=%s ip=%s interval=%d fail_thr=%d cooldown=%d cycle_pause=%d monitor=%s idle_thr=%d mode=%s",
             t.port, t.ip, t.interval, t.fail_threshold, t.cooldown, t.cycle_pause,
@@ -415,27 +535,36 @@ static void daemonize(void)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Использование: %s [-c конфиг] [-l poe_ctl.sh] [-f]\n"
+        "Использование: %s [-c конфиг] [-l poe_ctl.sh] [-f] [-A|a 'port ip interval fail_threshold cooldown cycle_pause [monitor_iface idle_threshold [mode [watch_scope]]]']\n"
         "  -c путь   путь к конфигу (по умолчанию %s)\n"
         "  -l путь   путь к скрипту управления PoE (по умолчанию %s)\n"
-        "  -f        не демонизироваться, работать в foreground\n",
-        prog, DEFAULT_CONFIG, DEFAULT_CTL_SCRIPT);
+        "  -f        не демонизироваться, работать в foreground\n"
+        "  -A/ -a    добавить или обновить target в конфиг из CLI, например:\n"
+        "            %s -A 'G01 192.168.1.11 5 3 60 5 eth0 30 SEMIAUTO both'\n",
+        prog, DEFAULT_CONFIG, DEFAULT_CTL_SCRIPT, prog);
 }
 
 int main(int argc, char **argv)
 {
     int foreground = 0;
+    char *add_line = NULL;
     strncpy(config_path, DEFAULT_CONFIG, sizeof(config_path) - 1);
     strncpy(ctl_script, DEFAULT_CTL_SCRIPT, sizeof(ctl_script) - 1);
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:l:fh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:l:fhA:a:")) != -1) {
         switch (opt) {
         case 'c': strncpy(config_path, optarg, sizeof(config_path) - 1); break;
         case 'l': strncpy(ctl_script, optarg, sizeof(ctl_script) - 1); break;
         case 'f': foreground = 1; break;
+        case 'A':
+        case 'a': add_line = optarg; break;
         default:  usage(argv[0]); return 1;
         }
+    }
+
+    if (add_line != NULL) {
+        return update_config_file(config_path, add_line);
     }
 
     openlog("poe_watchdog", LOG_PID | (foreground ? LOG_PERROR : 0), LOG_DAEMON);

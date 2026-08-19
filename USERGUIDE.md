@@ -55,6 +55,15 @@ echo G24 > /sys/poe0/port_power_off
 echo G24 > /sys/poe0/port_power_on
 ```
 
+Добавить или обновить target из CLI:
+
+```sh
+/usr/sbin/poe_watchdog -A 'G01 192.168.1.11 5 3 60 5 eth0 30 SEMIAUTO both'
+/usr/sbin/poe_watchdog -c /etc/poe_watchdog.conf -A 'G05 192.168.1.15 10 3 120 5'
+```
+
+Команда принимает тот же формат строки, что и `/etc/poe_watchdog.conf`, и обновляет target по идентификатору порта без ручного редактирования файла.
+
 ## 4. Подготовка конфигурации
 
 Отредактировать `/etc/poe_watchdog.conf` и выбрать безопасную тестовую строку.
