@@ -37,13 +37,16 @@ typedef struct {
     int      cooldown;
     int      cycle_pause;
     char     mode[32];         /* PoE mode for on-state, e.g. SEMIAUTO or AUTO */
-    char     watch_scope[16]; /* port, os, or both */
+    char     watch_scope[16]; /* port, os, link, or both */
 
-    /* optional packet-flow monitoring */
+    /* optional monitoring */
     char     monitor_iface[32]; /* interface name to watch, e.g. eth0 */
     int      idle_threshold;    /* seconds of no packets to consider idle (0 = disabled) */
+    int      link_timeout;      /* seconds without carrier before reset (0 = disabled) */
     unsigned long long last_pkt_count;
     time_t   last_pkt_time;
+    time_t   last_link_time;
+    int      last_link_up;
 
     /* runtime state */
     int      fail_count;
@@ -94,12 +97,13 @@ static int parse_target_line(const char *line, target_t *out)
      * 2) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold
      * 3) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode
      * 4) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode watch_scope
+     * 5) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode watch_scope link_timeout
      */
     p = pbuf;
-    int got = sscanf(p, "%31s %63s %d %d %d %d %31s %d %31s %31s",
+    int got = sscanf(p, "%31s %63s %d %d %d %d %31s %d %31s %31s %d",
                      t.port, t.ip, &t.interval,
                      &t.fail_threshold, &t.cooldown, &t.cycle_pause,
-                     t.monitor_iface, &t.idle_threshold, t.mode, t.watch_scope);
+                     t.monitor_iface, &t.idle_threshold, t.mode, t.watch_scope, &t.link_timeout);
     if (got < 6) {
         return -1;
     }
@@ -108,17 +112,29 @@ static int parse_target_line(const char *line, target_t *out)
         t.idle_threshold = 0;
         t.mode[0] = '\0';
         t.watch_scope[0] = '\0';
+        t.link_timeout = 0;
     } else if (got < 9) {
         t.mode[0] = '\0';
         t.watch_scope[0] = '\0';
+        t.link_timeout = 0;
     } else if (got < 10) {
         t.watch_scope[0] = '\0';
+        t.link_timeout = 0;
+    } else if (got < 11) {
+        t.link_timeout = 0;
     }
     if (t.mode[0] == '\0') {
         snprintf(t.mode, sizeof(t.mode), "SEMIAUTO");
     }
     if (t.watch_scope[0] == '\0') {
         snprintf(t.watch_scope, sizeof(t.watch_scope), "both");
+    }
+    if (t.link_timeout <= 0) {
+        if (t.idle_threshold > 0) {
+            t.link_timeout = t.idle_threshold;
+        } else {
+            t.link_timeout = 30;
+        }
     }
     if (t.interval <= 0) t.interval = 5;
     if (t.fail_threshold <= 0) t.fail_threshold = 3;
@@ -130,6 +146,8 @@ static int parse_target_line(const char *line, target_t *out)
     t.cycles_done = 0;
     t.last_pkt_count = 0ULL;
     t.last_pkt_time = 0;
+    t.last_link_time = 0;
+    t.last_link_up = 0;
     *out = t;
     return 0;
 }
@@ -157,6 +175,12 @@ static void format_target_line(const target_t *t, char *buf, size_t size)
     }
     if (t->watch_scope[0] != '\0') {
         int extra = snprintf(buf + written, size - (size_t)written, " %s", t->watch_scope);
+        if (extra > 0 && (size_t)extra < size - (size_t)written) {
+            written += extra;
+        }
+    }
+    if (t->link_timeout > 0) {
+        int extra = snprintf(buf + written, size - (size_t)written, " %d", t->link_timeout);
         if (extra > 0 && (size_t)extra < size - (size_t)written) {
             written += extra;
         }
@@ -307,6 +331,22 @@ static int read_iface_packets(const char *ifname, unsigned long long *out)
     return 0;
 }
 
+static int read_iface_carrier(const char *ifname, int *out)
+{
+    char path[128];
+    FILE *f;
+    int value = 0;
+
+    snprintf(path, sizeof(path), "/sys/class/net/%s/carrier", ifname);
+    f = fopen(path, "r");
+    if (!f) return -1;
+    if (fscanf(f, "%d", &value) != 1) { fclose(f); return -1; }
+    fclose(f);
+
+    *out = value;
+    return 0;
+}
+
 static int send_mode_via_socket(const char *port, const char *mode)
 {
     const char *sock_path = "/var/run/poed.sock";
@@ -430,14 +470,18 @@ static void check_target(target_t *t, time_t now)
 {
     int os_watch = 0;
     int port_watch = 0;
+    int link_watch = 0;
 
     if (strcmp(t->watch_scope, "port") == 0) {
         port_watch = 1;
     } else if (strcmp(t->watch_scope, "os") == 0) {
         os_watch = 1;
+    } else if (strcmp(t->watch_scope, "link") == 0) {
+        link_watch = 1;
     } else {
         port_watch = 1;
         os_watch = 1;
+        link_watch = 1;
     }
 
     if (now < t->next_check) {
@@ -449,6 +493,30 @@ static void check_target(target_t *t, time_t now)
     if (now < t->cooldown_until) {
         syslog(LOG_DEBUG, "poe_watchdog: порт %s в cooldown до %ld (через %ld сек)", t->port, (long)t->cooldown_until, (long)(t->cooldown_until - now));
         return;
+    }
+
+    /* Physical link monitoring (optional) */
+    if (link_watch && t->monitor_iface[0] != '\0' && t->link_timeout > 0) {
+        int carrier = 0;
+        if (read_iface_carrier(t->monitor_iface, &carrier) == 0) {
+            if (carrier == 0) {
+                if (t->last_link_time == 0) {
+                    t->last_link_time = now;
+                    t->last_link_up = 0;
+                    syslog(LOG_DEBUG, "poe_watchdog: link down on %s, timer started for port %s", t->monitor_iface, t->port);
+                } else if ((now - t->last_link_time) >= t->link_timeout) {
+                    syslog(LOG_WARNING, "poe_watchdog: интерфейс %s потерял carrier более %d сек — перезагрузка порта %s (watch_scope=%s)",
+                           t->monitor_iface, t->link_timeout, t->port, t->watch_scope);
+                    power_cycle_port(t);
+                    return;
+                }
+            } else {
+                t->last_link_time = 0;
+                t->last_link_up = 1;
+            }
+        } else {
+            syslog(LOG_DEBUG, "poe_watchdog: не удалось прочитать carrier для интерфейса %s", t->monitor_iface);
+        }
     }
 
     /* Packet-flow monitoring (optional) */

@@ -61,7 +61,7 @@ poe_watchdog
 Формат `/etc/poe_watchdog.conf`:
 
 ```
-<port> <ip> <interval_sec> <fail_threshold> <cooldown_sec> <cycle_pause_sec> [monitor_iface idle_threshold [mode [watch_scope]]]
+<port> <ip> <interval_sec> <fail_threshold> <cooldown_sec> <cycle_pause_sec> [monitor_iface idle_threshold [mode [watch_scope [link_timeout_sec]]]]
 ```
 
 Параметры:
@@ -74,7 +74,8 @@ poe_watchdog
 - `monitor_iface` — интерфейс, по которому контролируется наличие трафика.
 - `idle_threshold` — время простоя трафика в секундах до срабатывания.
 - `mode` — режим PoE после восстановления, например `AUTO`, `SEMIAUTO`, `OFF`.
-- `watch_scope` — `port`, `os` или `both`.
+- `watch_scope` — `port`, `os`, `link` или `both`.
+- `link_timeout_sec` — время без carrier на `monitor_iface` до power-cycle, используется при `watch_scope=link` или `both`.
 
 Примеры конфигурации:
 
