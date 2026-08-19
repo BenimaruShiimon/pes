@@ -2,9 +2,9 @@ config BR2_PACKAGE_POE_WATCHDOG
     bool "poe_watchdog"
     help
       PoE watchdog daemon for embedded devices.
-      Runs a daemon that monitors configured PoE-powered devices via ping
-      and power-cycles the corresponding PoE port when the device becomes
-      unreachable.
+      Runs a daemon that monitors the physical interface state and traffic
+      on the configured PoE port and power-cycles the port when carrier or
+      packet activity indicates a failure.
 
       The package installs /usr/sbin/poe_watchdog, /usr/sbin/poe_ctl.sh,
       /etc/poe_watchdog.conf and the init script /etc/init.d/S99poe_watchdog.

@@ -31,13 +31,12 @@
 
 typedef struct {
     char     port[32];
-    char     ip[64];
     int      interval;
     int      fail_threshold;
     int      cooldown;
     int      cycle_pause;
     char     mode[32];         /* PoE mode for on-state, e.g. SEMIAUTO or AUTO */
-    char     watch_scope[16]; /* port, os, link, or both */
+    char     watch_scope[16]; /* os, link, both */
 
     /* optional monitoring */
     char     monitor_iface[32]; /* interface name to watch, e.g. eth0 */
@@ -93,34 +92,27 @@ static int parse_target_line(const char *line, target_t *out)
 
     memset(&t, 0, sizeof(t));
     /* Supported formats:
-     * 1) port ip interval fail_threshold cooldown cycle_pause
-     * 2) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold
-     * 3) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode
-     * 4) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode watch_scope
-     * 5) port ip interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode watch_scope link_timeout
+     * 1) port interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold
+     * 2) port interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode
+     * 3) port interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode watch_scope
+     * 4) port interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold mode watch_scope link_timeout
      */
     p = pbuf;
-    int got = sscanf(p, "%31s %63s %d %d %d %d %31s %d %31s %31s %d",
-                     t.port, t.ip, &t.interval,
+    int got = sscanf(p, "%31s %d %d %d %d %31s %d %31s %31s %d",
+                     t.port, &t.interval,
                      &t.fail_threshold, &t.cooldown, &t.cycle_pause,
                      t.monitor_iface, &t.idle_threshold, t.mode, t.watch_scope, &t.link_timeout);
-    if (got < 6) {
+    if (got < 7) {
         return -1;
     }
     if (got < 8) {
-        t.monitor_iface[0] = '\0';
-        t.idle_threshold = 0;
         t.mode[0] = '\0';
         t.watch_scope[0] = '\0';
         t.link_timeout = 0;
     } else if (got < 9) {
-        t.mode[0] = '\0';
         t.watch_scope[0] = '\0';
         t.link_timeout = 0;
     } else if (got < 10) {
-        t.watch_scope[0] = '\0';
-        t.link_timeout = 0;
-    } else if (got < 11) {
         t.link_timeout = 0;
     }
     if (t.mode[0] == '\0') {
@@ -156,8 +148,8 @@ static void format_target_line(const target_t *t, char *buf, size_t size)
 {
     int written = 0;
     if (size == 0) return;
-    written = snprintf(buf, size, "%s %s %d %d %d %d",
-                       t->port, t->ip, t->interval,
+    written = snprintf(buf, size, "%s %d %d %d %d",
+                       t->port, t->interval,
                        t->fail_threshold, t->cooldown, t->cycle_pause);
     if (written < 0 || (size_t)written >= size) return;
     if (t->monitor_iface[0] != '\0') {
@@ -266,8 +258,8 @@ static int load_config(const char *path)
             continue;
         }
         targets[n++] = t;
-        syslog(LOG_DEBUG, "poe_watchdog: added target port=%s ip=%s interval=%d fail_thr=%d cooldown=%d cycle_pause=%d monitor=%s idle_thr=%d mode=%s",
-            t.port, t.ip, t.interval, t.fail_threshold, t.cooldown, t.cycle_pause,
+        syslog(LOG_DEBUG, "poe_watchdog: added target port=%s interval=%d fail_thr=%d cooldown=%d cycle_pause=%d monitor=%s idle_thr=%d mode=%s",
+            t.port, t.interval, t.fail_threshold, t.cooldown, t.cycle_pause,
             t.monitor_iface[0] ? t.monitor_iface : "(none)", t.idle_threshold, t.mode);
     }
     fclose(f);
@@ -280,32 +272,6 @@ static int load_config(const char *path)
     target_count = n;
     syslog(LOG_INFO, "poe_watchdog: загружено %d целей из %s", n, path);
     return 0;
-}
-
-static int ping_target(const char *ip)
-{
-    pid_t pid = fork();
-    if (pid < 0) {
-        syslog(LOG_ERR, "poe_watchdog: fork() для ping не удался: %s", strerror(errno));
-        return 0;
-    }
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > 2) close(devnull);
-        }
-        char timeout_str[16];
-        snprintf(timeout_str, sizeof(timeout_str), "%d", PING_TIMEOUT_SEC);
-        char *const argv[] = {"ping", "-c", "1", "-W", timeout_str, (char *)ip, NULL};
-        execvp("ping", argv);
-        _exit(127);
-    }
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) return 0;
-    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : 0;
 }
 
 /* Read combined rx+tx packet counters for an interface. Returns 0 on success. */
@@ -440,9 +406,8 @@ static int set_port_mode(const char *port, const char *mode)
 static void power_cycle_port(target_t *t)
 {
     syslog(LOG_WARNING,
-           "poe_watchdog: порт %s (%s) не отвечает %d проверок подряд — перезагрузка PoE-питания",
-           t->port, t->ip, t->fail_count);
-
+           "poe_watchdog: порт %s не отвечает %d проверок подряд — перезагрузка PoE-питания",
+           t->port, t->fail_count);
     int off_mode = strcmp(t->mode, "OFF") == 0 ? 0 : 1;
     const char *off_mode_name = off_mode ? "DISABLED" : "OFF";
     const char *on_mode_name = t->mode[0] ? t->mode : "SEMIAUTO";
@@ -469,17 +434,14 @@ static void power_cycle_port(target_t *t)
 static void check_target(target_t *t, time_t now)
 {
     int os_watch = 0;
-    int port_watch = 0;
     int link_watch = 0;
 
-    if (strcmp(t->watch_scope, "port") == 0) {
-        port_watch = 1;
-    } else if (strcmp(t->watch_scope, "os") == 0) {
+    if (strcmp(t->watch_scope, "os") == 0) {
         os_watch = 1;
     } else if (strcmp(t->watch_scope, "link") == 0) {
         link_watch = 1;
     } else {
-        port_watch = 1;
+        /* legacy 'port' mode is treated as physical monitoring only */
         os_watch = 1;
         link_watch = 1;
     }
@@ -548,27 +510,10 @@ static void check_target(target_t *t, time_t now)
         }
     }
 
-    /* Reachability ping monitoring */
-    if (port_watch) {
-        syslog(LOG_DEBUG, "poe_watchdog: пингуем %s (%s) scope=%s", t->port, t->ip, t->watch_scope);
-        if (ping_target(t->ip)) {
-            syslog(LOG_DEBUG, "poe_watchdog: ping OK %s (%s)", t->port, t->ip);
-            if (t->fail_count > 0) {
-                syslog(LOG_INFO, "poe_watchdog: порт %s (%s) снова отвечает после %d неудач",
-                       t->port, t->ip, t->fail_count);
-            }
-            t->fail_count = 0;
-            return;
-        }
-        syslog(LOG_DEBUG, "poe_watchdog: ping FAIL %s (%s)", t->port, t->ip);
-
-        t->fail_count++;
-        syslog(LOG_DEBUG, "poe_watchdog: порт %s (%s) не отвечает (%d/%d) scope=%s",
-            t->port, t->ip, t->fail_count, t->fail_threshold, t->watch_scope);
-        if (t->fail_count >= t->fail_threshold) {
-            power_cycle_port(t);
-        }
-    }
+    /* Network-address monitoring is intentionally disabled in this branch.
+     * The watchdog checks only the physical interface state and traffic level.
+     */
+    (void)t;
 }
 
 static void daemonize(void)
@@ -603,12 +548,12 @@ static void daemonize(void)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Использование: %s [-c конфиг] [-l poe_ctl.sh] [-f] [-A|a 'port ip interval fail_threshold cooldown cycle_pause [monitor_iface idle_threshold [mode [watch_scope]]]']\n"
+        "Использование: %s [-c конфиг] [-l poe_ctl.sh] [-f] [-A|a 'port interval fail_threshold cooldown cycle_pause monitor_iface idle_threshold [mode [watch_scope [link_timeout_sec]]]']\n"
         "  -c путь   путь к конфигу (по умолчанию %s)\n"
         "  -l путь   путь к скрипту управления PoE (по умолчанию %s)\n"
         "  -f        не демонизироваться, работать в foreground\n"
         "  -A/ -a    добавить или обновить target в конфиг из CLI, например:\n"
-        "            %s -A 'G01 192.168.1.11 5 3 60 5 eth0 30 SEMIAUTO both'\n",
+        "            %s -A 'G01 5 3 60 5 eth0 30 SEMIAUTO link 20'\n",
         prog, DEFAULT_CONFIG, DEFAULT_CTL_SCRIPT, prog);
 }
 
